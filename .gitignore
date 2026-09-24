@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+.env
+debug_esaj.png
+esaj-test.png
+esaj-test2.png
+.claude/
