@@ -6,18 +6,24 @@ e-SAJ) costumam detectar e bloquear o headless nativo, mas não distinguem um
 Chrome "de cabeça" rodando contra um display virtual sem monitor real.
 """
 import logging
+import re
 import threading
 from contextlib import contextmanager
 
 import psutil
 import undetected_chromedriver as uc
-from bs4 import BeautifulSoup
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from bs4 import BeautifulSoup, NavigableString
+from selenium.common.exceptions import (
+    NoAlertPresentException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from app.adapters.base import (
+    CaptchaRequiredError,
     ConsultaResultado,
     InvalidProcessError,
     Movimentacao,
@@ -107,26 +113,92 @@ def _driver_session():
             display.stop()
 
 
-def _extrair_partes(soup: BeautifulSoup) -> list[dict]:
-    partes = []
-    tabela = soup.find(id="tablePartesPrincipais")
-    if not tabela:
-        return partes
+_RE_DATA = re.compile(r"^\d{2}/\d{2}/\d{4}$")
 
+_POLO_ATIVO = ("reqte", "requerente", "autor", "exeqte", "exequente", "impetrante",
+               "embargte", "apelante", "credor", "agravante")
+_POLO_PASSIVO = ("reqdo", "reqda", "requerido", "requerida", "réu", "reu", "executado",
+                 "impetrado", "embargdo", "apelado", "devedor", "agravado")
+
+
+def _polo_da_parte(tipo: str) -> str:
+    t = tipo.strip().lower().rstrip(".:")
+    if t.startswith(_POLO_ATIVO):
+        return "ATIVO"
+    if t.startswith(_POLO_PASSIVO):
+        return "PASSIVO"
+    return tipo.strip().upper()
+
+
+def _expandir_movimentacoes(driver: uc.Chrome) -> None:
+    """O e-SAJ não traz as movimentações no HTML inicial: a página vem com um
+    #containerMovimentacoes vazio e o botão "Exibir movimentações", que carrega o
+    conteúdo por AJAX. Sem este clique a extração volta sempre vazia."""
+    containers = driver.find_elements(By.ID, "containerMovimentacoes")
+    botoes = driver.find_elements(By.ID, "btnExibirMovimentacoes")
+    if not containers or not botoes:
+        return  # layout antigo (movimentações já na página) ou já expandido
+
+    tamanho_inicial = len(containers[0].get_attribute("innerHTML") or "")
+    driver.execute_script("arguments[0].click();", botoes[0])
+    try:
+        WebDriverWait(driver, settings.scraper_timeout_seconds).until(
+            lambda d: len(
+                d.find_element(By.ID, "containerMovimentacoes").get_attribute("innerHTML") or ""
+            ) > tamanho_inicial + 200
+        )
+    except TimeoutException:
+        log.warning("Movimentações do e-SAJ não carregaram após o clique")
+
+
+def _extrair_partes(soup: BeautifulSoup) -> list[dict]:
+    """Cada linha: <span class="tipoDeParticipacao">Reqte</span> e um
+    td.nomeParteEAdvogado com o nome da parte, um <br>, e depois os advogados."""
+    tabela = soup.find(id="tablePartesPrincipais") or soup.find(id="tableTodasPartes")
+    if not tabela:
+        return []
+
+    partes = []
     for linha in tabela.find_all("tr"):
-        celulas = linha.find_all("td")
-        if len(celulas) < 2:
+        tipo_el = linha.find("span", class_="tipoDeParticipacao")
+        celula = linha.find("td", class_="nomeParteEAdvogado")
+        if not tipo_el or not celula:
             continue
-        tipo = " ".join(celulas[0].get_text().split()).rstrip(":")
-        nome = " ".join(celulas[1].get_text().split())
-        if tipo and nome:
-            partes.append({"tipo": tipo, "nome": nome})
+
+        nome = ""
+        for filho in celula.contents:
+            if getattr(filho, "name", None) == "br":
+                break
+            if isinstance(filho, NavigableString):
+                nome = " ".join(str(filho).split())
+                if nome:
+                    break
+
+        advogados = []
+        for span in celula.find_all("span", class_="mensagemExibindo"):
+            seguinte = span.next_sibling
+            adv = " ".join(str(seguinte).split()) if seguinte else ""
+            if adv:
+                advogados.append(adv)
+
+        tipo = " ".join(tipo_el.get_text().split())
+        if nome:
+            partes.append(
+                {"nome": nome, "polo": _polo_da_parte(tipo), "tipo": tipo, "advogados": advogados}
+            )
     return partes
 
 
 def _extrair_movimentacoes_esaj(soup: BeautifulSoup) -> list[Movimentacao]:
-    tabela = soup.find(id="tabelaTodasMovimentacoes") or soup.find(id="tabelaUltimasMovimentacoes")
-    if not tabela:
+    # A tabela é buscada DENTRO do container: a mesma página tem a tabela
+    # "Petições diversas", também com datas, que não é andamento do processo.
+    tabela = None
+    container = soup.find(id="containerMovimentacoes")
+    if container:
+        tabela = container.find("table")
+    if tabela is None:
+        tabela = soup.find(id="tabelaTodasMovimentacoes") or soup.find(id="tabelaUltimasMovimentacoes")
+    if tabela is None:
         return []
 
     movimentacoes = []
@@ -134,9 +206,10 @@ def _extrair_movimentacoes_esaj(soup: BeautifulSoup) -> list[Movimentacao]:
         celulas = linha.find_all("td")
         if len(celulas) < 2:
             continue
-        data_raw = celulas[0].get_text().strip()
-        descricao = celulas[2].get_text() if len(celulas) > 2 else celulas[1].get_text()
-        descricao = " ".join(descricao.split())
+        data_raw = " ".join(celulas[0].get_text().split())
+        if not _RE_DATA.match(data_raw):
+            continue  # cabeçalho e linhas de espaçamento
+        descricao = " ".join(celulas[-1].get_text().split())
         if descricao:
             movimentacoes.append(Movimentacao(descricao=descricao, data_raw=data_raw))
     return movimentacoes
@@ -174,6 +247,16 @@ def _scrape_eproc(driver: uc.Chrome, numero_cnj: str) -> ConsultaResultado:
         botao = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
     botao.click()
 
+    # O EPROC protege a consulta com captcha: se o clique dispara o alerta
+    # "Aguarde a verificação do captcha", a busca não aconteceu.
+    try:
+        alerta = driver.switch_to.alert
+        texto_alerta = alerta.text
+        alerta.accept()
+        raise CaptchaRequiredError(f"EPROC exige captcha: {texto_alerta}")
+    except NoAlertPresentException:
+        pass
+
     try:
         wait.until(
             lambda d: "tabelaEventos" in d.page_source
@@ -184,6 +267,11 @@ def _scrape_eproc(driver: uc.Chrome, numero_cnj: str) -> ConsultaResultado:
 
     if "Nenhum registro encontrado" in driver.page_source:
         raise NotFoundError("Processo não encontrado no EPROC")
+
+    # Sem a tabela de eventos a leitura falhou (captcha, layout novo). Devolver
+    # zero movimentações seria pior: o cliente veria "processo sem andamento".
+    if not driver.find_elements(By.ID, "tabelaEventos"):
+        raise ParserError("EPROC não devolveu a tabela de eventos")
 
     soup = BeautifulSoup(driver.page_source, "html.parser")
 
@@ -270,6 +358,7 @@ def _scrape_esaj(driver: uc.Chrome, numero_cnj: str) -> ConsultaResultado:
     ):
         return _scrape_eproc(driver, numero_formatado)
 
+    _expandir_movimentacoes(driver)
     soup = BeautifulSoup(driver.page_source, "html.parser")
     classe_el = soup.find(id="classeProcesso")
     assunto_el = soup.find(id="assuntoProcesso")
