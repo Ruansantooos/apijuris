@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import uuid
 from datetime import datetime
 
@@ -11,6 +12,8 @@ from app.cnj import clean_cnj, identificar_tribunal
 from app.datas import parse_data_fonte
 from app.models import Client, Consultation, Process, ProcessMovement
 from app.schemas import ProcessoCreate
+
+log = logging.getLogger("services.processos")
 
 
 class ProcessoInvalidoError(Exception):
@@ -101,9 +104,10 @@ def executar_consulta(db: Session, processo: Process) -> Consultation:
         consulta.finished_at = datetime.utcnow()
         db.commit()
         return consulta
-    except Exception as exc:  # falha inesperada do adapter não deve derrubar a API
+    except Exception:  # falha inesperada do adapter não deve derrubar a API
+        log.exception("Erro inesperado no adapter %s (consulta %s)", processo.tribunal, consulta.id)
         consulta.status = "parser_error"
-        consulta.error = f"Erro inesperado no adapter: {exc}"
+        consulta.error = "Erro inesperado ao processar a resposta da fonte"
         consulta.finished_at = datetime.utcnow()
         db.commit()
         return consulta

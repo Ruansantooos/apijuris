@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -16,6 +16,9 @@ from app.services.processos import (
 )
 
 router = APIRouter(prefix="/v1/processos", tags=["processos"])
+
+Limit = Query(50, ge=1, le=200)
+Offset = Query(0, ge=0)
 
 
 def _get_processo_or_404(db: Session, tenant_id: uuid.UUID, processo_id: uuid.UUID) -> Process:
@@ -42,7 +45,7 @@ def cadastrar_processo(payload: ProcessoCreate, db: Session = Depends(get_db)):
 
 
 @router.get("", response_model=list[ProcessoOut])
-def listar_processos(limit: int = 50, offset: int = 0, db: Session = Depends(get_db)):
+def listar_processos(limit: int = Limit, offset: int = Offset, db: Session = Depends(get_db)):
     tenant = get_or_create_default_tenant(db)
     return (
         db.query(Process)
@@ -73,7 +76,7 @@ def desativar_processo(processo_id: uuid.UUID, db: Session = Depends(get_db)):
 
 @router.get("/{processo_id}/movimentacoes", response_model=list[MovimentacaoOut])
 def listar_movimentacoes(
-    processo_id: uuid.UUID, limit: int = 50, offset: int = 0, db: Session = Depends(get_db)
+    processo_id: uuid.UUID, limit: int = Limit, offset: int = Offset, db: Session = Depends(get_db)
 ):
     tenant = get_or_create_default_tenant(db)
     _get_processo_or_404(db, tenant.id, processo_id)

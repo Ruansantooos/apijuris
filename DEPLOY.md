@@ -24,7 +24,13 @@ chmod +x deploy/install.sh
 ./deploy/install.sh
 ```
 
-Isso instala Docker + Docker Compose e libera a porta 8000 no firewall (ufw).
+Isso instala Docker + Docker Compose e ativa o firewall (ufw).
+
+> **Atenção: o ufw NÃO protege portas publicadas pelo Docker.** O Docker grava
+> as próprias regras de iptables e elas passam por cima do ufw. Mesmo que você
+> bloqueie a 8000 no ufw, `ports: "8000:8000"` no compose continua expondo a API
+> para a internet inteira. Para restringir de verdade, publique só no localhost
+> (`"127.0.0.1:8000:8000"`) e coloque um Nginx com HTTPS na frente (item 6).
 
 ## 2. Configurar variáveis de ambiente
 
@@ -35,6 +41,14 @@ nano .env
 
 Troque pelo menos `POSTGRES_PASSWORD` (e replique a mesma senha dentro de
 `DATABASE_URL`). Não comite o `.env` — ele já está no `.gitignore`.
+
+Gere uma senha forte com `openssl rand -base64 32`.
+
+- `DATABASE_URL` é obrigatório: sem ele a API se recusa a subir.
+- `ENVIRONMENT=production` esconde `/docs`, `/redoc` e `/openapi.json`. Para
+  usar o Swagger durante testes, troque temporariamente para `dev`.
+- `CORS_ORIGINS` só precisa ser preenchido se um front-end em navegador for
+  chamar a API (ex.: `["https://painel.seudominio.com.br"]`).
 
 ## 3. Subir os containers
 
@@ -68,7 +82,13 @@ curl -X POST http://localhost:8000/v1/processos/<ID>/consultar
 curl http://localhost:8000/v1/processos/<ID>/movimentacoes
 ```
 
-A documentação interativa (Swagger) fica em `http://<IP_DA_VPS>:8000/docs`.
+Com `ENVIRONMENT=dev`, a documentação interativa (Swagger) fica em
+`http://<IP_DA_VPS>:8000/docs`. Em `production` ela fica desligada.
+
+> **A API ainda não tem autenticação.** Até a fase das API Keys, qualquer pessoa
+> que alcance a porta 8000 pode cadastrar processos e disparar consultas (cada
+> uma abre um Chrome na VPS). Não deixe a porta aberta para a internet além do
+> tempo de teste.
 
 ## 5. Atualizações futuras
 

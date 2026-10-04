@@ -25,6 +25,9 @@ services:
       - "8000:8000"
     # Chrome precisa de mais que os 64MB padrão de /dev/shm do Docker, ou trava.
     shm_size: "1gb"
+    # Sem um init como PID 1, processos do Chrome encerrados viram zumbis que
+    # ninguém recolhe e se acumulam a cada consulta.
+    init: true
 
 volumes:
   pgdata:

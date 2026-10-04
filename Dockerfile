@@ -18,6 +18,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# O Chrome roda com --no-sandbox (exigência dentro do Docker) e abre sites de
+# terceiros: se uma página explorar o navegador, o atacante herda o usuário do
+# processo. Rodando como "app" em vez de root, ele não ganha root no container.
+RUN useradd --create-home --shell /usr/sbin/nologin app
+USER app
+
 EXPOSE 8000
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

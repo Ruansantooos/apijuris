@@ -7,6 +7,7 @@ entrar (PRD seção 17).
 """
 import uuid
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import Tenant
@@ -16,8 +17,16 @@ DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
 def get_or_create_default_tenant(db: Session) -> Tenant:
     tenant = db.get(Tenant, DEFAULT_TENANT_ID)
-    if tenant is None:
+    if tenant is not None:
+        return tenant
+
+    # Duas requisições simultâneas com o banco vazio podem tentar criar o mesmo
+    # tenant; a que perder a corrida recua e lê o que a outra gravou.
+    try:
         tenant = Tenant(id=DEFAULT_TENANT_ID, name="default", plan="starter", status="ativo")
         db.add(tenant)
         db.commit()
-    return tenant
+        return tenant
+    except IntegrityError:
+        db.rollback()
+        return db.get(Tenant, DEFAULT_TENANT_ID)

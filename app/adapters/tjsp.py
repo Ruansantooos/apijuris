@@ -9,6 +9,7 @@ import logging
 import threading
 from contextlib import contextmanager
 
+import psutil
 import undetected_chromedriver as uc
 from bs4 import BeautifulSoup
 from selenium.common.exceptions import TimeoutException, WebDriverException
@@ -36,6 +37,39 @@ log = logging.getLogger("adapters.tjsp")
 _scrape_lock = threading.Semaphore(settings.scraper_max_concurrency)
 
 
+def _processos_do_driver(driver: uc.Chrome) -> list[psutil.Process]:
+    """Chrome + chromedriver e todos os filhos (renderers, GPU, etc.).
+
+    Precisa ser coletado ANTES do quit(): depois que o pai morre, os filhos órfãos
+    são adotados pelo init e não aparecem mais em children().
+    """
+    raizes = []
+    for pid in (getattr(driver, "browser_pid", None), getattr(driver.service.process, "pid", None)):
+        if pid:
+            try:
+                raizes.append(psutil.Process(pid))
+            except psutil.NoSuchProcess:
+                pass
+
+    processos = list(raizes)
+    for raiz in raizes:
+        try:
+            processos.extend(raiz.children(recursive=True))
+        except psutil.NoSuchProcess:
+            pass
+    return processos
+
+
+def _matar_sobreviventes(processos: list[psutil.Process]) -> None:
+    # psutil confere o create_time antes do kill: se o PID foi reaproveitado por
+    # outro processo do sistema, ele levanta NoSuchProcess em vez de matar o errado.
+    for proc in processos:
+        try:
+            proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+
 @contextmanager
 def _driver_session():
     display = None
@@ -49,6 +83,9 @@ def _driver_session():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--incognito")
     if settings.chrome_binary:
         options.binary_location = settings.chrome_binary
 
@@ -57,8 +94,15 @@ def _driver_session():
         driver = uc.Chrome(options=options)
         yield driver
     finally:
+        # Um Chrome que não morre a cada consulta vaza centenas de MB; poucas
+        # consultas com falha bastariam para esgotar a memória da VPS.
         if driver is not None:
-            driver.quit()
+            processos = _processos_do_driver(driver)
+            try:
+                driver.quit()
+            except Exception:
+                log.warning("driver.quit() falhou; encerrando processos do Chrome à força")
+            _matar_sobreviventes(processos)
         if display is not None:
             display.stop()
 
@@ -255,13 +299,17 @@ class TJSPAdapter(TribunalAdapter):
         if not acquired:
             raise SourceUnavailableError("Fila de consultas ao TJSP está cheia, tente novamente")
 
+        # Mensagens do Selenium trazem stacktrace, caminhos e versões internas: vão só
+        # para o log. O cliente da API recebe uma mensagem genérica.
         try:
             with _driver_session() as driver:
                 try:
                     return _scrape_esaj(driver, clean)
                 except TimeoutException as exc:
-                    raise SourceTimeoutError(str(exc)) from exc
+                    log.warning("Timeout consultando %s: %s", clean, exc)
+                    raise SourceTimeoutError("A fonte não respondeu dentro do tempo limite") from exc
                 except WebDriverException as exc:
-                    raise SourceUnavailableError(str(exc)) from exc
+                    log.exception("Falha do navegador consultando %s", clean)
+                    raise SourceUnavailableError("Falha ao acessar a fonte do tribunal") from exc
         finally:
             _scrape_lock.release()
